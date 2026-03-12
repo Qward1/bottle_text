@@ -43,11 +43,19 @@ class CropBox:
 class ProcessMetadata:
     original_width: int
     original_height: int
+    oriented_width: int
+    oriented_height: int
+    bottle_box: Dict[str, int]
+    bottle_found: bool
+    bottle_confidence: float
+    bottle_rotation_degrees: float
+    bottle_upside_down_corrected: bool
     crop_box: Dict[str, int]
     crop_found: bool
     upscale_factor: float
     candidate_boxes: int
     rotated_degrees: float
+    final_rotation_degrees: float
     glare_ratio: float
     detection_confidence: float
     top_candidates: List[Dict[str, float | int | str]]
@@ -59,6 +67,7 @@ class ProcessMetadata:
 
 @dataclass
 class ProcessResult:
+    oriented_bgr: np.ndarray
     crop_bgr: np.ndarray
     improved_bgr: np.ndarray
     bw: np.ndarray
@@ -75,6 +84,17 @@ class ScoredCandidate:
     area_ratio: float
     aspect_ratio: float
     source: str = "heuristic"
+
+
+@dataclass
+class BottleDetectionResult:
+    box: CropBox
+    found: bool
+    confidence: float
+    major_axis_angle: float
+    mask_ratio: float
+    source: str
+    mask: np.ndarray | None = None
 
 
 def decode_image(file_bytes: bytes) -> np.ndarray:
@@ -209,6 +229,42 @@ def pad_box(box: Tuple[int, int, int, int], image_shape: Tuple[int, int, int], p
     )
 
 
+def pad_text_box(box: Tuple[int, int, int, int], image_shape: Tuple[int, int, int], padding_ratio: float) -> CropBox:
+    h, w = image_shape[:2]
+    x1, y1, x2, y2 = clip_box(box, image_shape)
+    bw = max(1, x2 - x1)
+    bh = max(1, y2 - y1)
+    aspect = bw / float(bh + 1e-6)
+
+    min_pad = max(4, int(round(min(h, w) * 0.01)))
+    base_pad_x = max(int(round(bw * padding_ratio)), min_pad)
+    base_pad_y = max(int(round(bh * padding_ratio)), min_pad)
+
+    if aspect >= 2.4:
+        extra_pad_x = int(round(bw * 0.40))
+        extra_pad_top = int(round(bh * 0.34))
+        extra_pad_bottom = int(round(bh * 0.92))
+    elif aspect >= 1.4:
+        extra_pad_x = int(round(bw * 0.24))
+        extra_pad_top = int(round(bh * 0.22))
+        extra_pad_bottom = int(round(bh * 0.52))
+    else:
+        extra_pad_x = int(round(bw * 0.12))
+        extra_pad_top = int(round(bh * 0.16))
+        extra_pad_bottom = int(round(bh * 0.28))
+
+    pad_x = min(max(base_pad_x, extra_pad_x), int(round(w * 0.22)))
+    pad_top = min(max(base_pad_y, extra_pad_top), int(round(h * 0.14)))
+    pad_bottom = min(max(base_pad_y, extra_pad_bottom), int(round(h * 0.18)))
+
+    return CropBox(
+        x1=int(max(0, x1 - pad_x)),
+        y1=int(max(0, y1 - pad_top)),
+        x2=int(min(w, x2 + pad_x)),
+        y2=int(min(h, y2 + pad_bottom)),
+    )
+
+
 def scale_box(box: Tuple[int, int, int, int], scale: float) -> Tuple[int, int, int, int]:
     if abs(scale - 1.0) < 1e-6:
         return tuple(map(int, box))
@@ -218,6 +274,29 @@ def scale_box(box: Tuple[int, int, int, int], scale: float) -> Tuple[int, int, i
         int(round(y1 / scale)),
         int(round(x2 / scale)),
         int(round(y2 / scale)),
+    )
+
+
+def box_to_dict(box: CropBox) -> Dict[str, int]:
+    return {
+        "x1": int(box.x1),
+        "y1": int(box.y1),
+        "x2": int(box.x2),
+        "y2": int(box.y2),
+    }
+
+
+def tuple_to_crop_box(box: Tuple[int, int, int, int]) -> CropBox:
+    x1, y1, x2, y2 = map(int, box)
+    return CropBox(x1=x1, y1=y1, x2=x2, y2=y2)
+
+
+def offset_crop_box(box: CropBox, offset_x: int, offset_y: int) -> CropBox:
+    return CropBox(
+        x1=int(box.x1 + offset_x),
+        y1=int(box.y1 + offset_y),
+        x2=int(box.x2 + offset_x),
+        y2=int(box.y2 + offset_y),
     )
 
 
@@ -298,6 +377,385 @@ def build_detection_gray(image: np.ndarray, glare_mask: np.ndarray) -> np.ndarra
     gray = cv2.cvtColor(suppressed, cv2.COLOR_BGR2GRAY)
     gray = cv2.fastNlMeansDenoising(gray, None, 5, 7, 21)
     return normalize_illumination_gray(gray, clip_limit=2.0)
+
+
+def _smooth_1d(values: np.ndarray, kernel_size: int) -> np.ndarray:
+    if values.size == 0:
+        return values
+    kernel_size = max(1, int(kernel_size))
+    if kernel_size <= 1:
+        return values.astype(np.float32)
+    kernel = np.ones(kernel_size, dtype=np.float32) / float(kernel_size)
+    return np.convolve(values.astype(np.float32), kernel, mode="same")
+
+
+def mask_to_box(mask: np.ndarray) -> Tuple[int, int, int, int] | None:
+    ys, xs = np.where(mask > 0)
+    if xs.size == 0 or ys.size == 0:
+        return None
+    return int(np.min(xs)), int(np.min(ys)), int(np.max(xs) + 1), int(np.max(ys) + 1)
+
+
+def fill_mask_holes(mask: np.ndarray) -> np.ndarray:
+    if mask.size == 0:
+        return mask
+    flood = mask.copy()
+    h, w = mask.shape[:2]
+    work = np.zeros((h + 2, w + 2), dtype=np.uint8)
+    cv2.floodFill(flood, work, (0, 0), 255)
+    holes = cv2.bitwise_not(flood)
+    return cv2.bitwise_or(mask, holes)
+
+
+def clean_foreground_mask(
+    mask: np.ndarray,
+    min_area_ratio: float = 0.015,
+    max_area_ratio: float = 0.98,
+) -> np.ndarray:
+    if mask.size == 0:
+        return mask
+
+    h, w = mask.shape[:2]
+    clean = (mask > 0).astype(np.uint8) * 255
+    k = max(3, int(round(min(h, w) * 0.02)))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    clean = cv2.morphologyEx(clean, cv2.MORPH_CLOSE, kernel)
+    clean = cv2.morphologyEx(clean, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (max(3, k // 2), max(3, k // 2))))
+    clean = fill_mask_holes(clean)
+
+    min_area = int(h * w * min_area_ratio)
+    max_area = int(h * w * max_area_ratio)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats((clean > 0).astype(np.uint8), connectivity=8)
+    filtered = np.zeros_like(clean)
+    for idx in range(1, num_labels):
+        x, y, bw, bh, area = stats[idx]
+        if area < min_area or area > max_area:
+            continue
+        if bw < max(12, int(w * 0.07)) or bh < max(18, int(h * 0.12)):
+            continue
+        filtered[labels == idx] = 255
+    return filtered
+
+
+def build_border_foreground_mask(image: np.ndarray) -> np.ndarray:
+    h, w = image.shape[:2]
+    balanced = gray_world_white_balance(image)
+    lab = cv2.cvtColor(balanced, cv2.COLOR_BGR2LAB).astype(np.float32)
+
+    band = max(8, int(round(min(h, w) * 0.05)))
+    border = np.concatenate(
+        [
+            lab[:band, :, :].reshape(-1, 3),
+            lab[-band:, :, :].reshape(-1, 3),
+            lab[:, :band, :].reshape(-1, 3),
+            lab[:, -band:, :].reshape(-1, 3),
+        ],
+        axis=0,
+    )
+    border_median = np.median(border, axis=0)
+    diff = np.linalg.norm(lab - border_median.reshape(1, 1, 3), axis=2)
+    diff = cv2.GaussianBlur(diff.astype(np.float32), (0, 0), sigmaX=max(2.0, min(h, w) / 90.0))
+    diff_u8 = cv2.normalize(diff, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+    _, mask = cv2.threshold(diff_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    area_ratio = float(np.mean(mask > 0))
+    if area_ratio < 0.03 or area_ratio > 0.92:
+        threshold = max(10.0, float(np.percentile(diff, 72)))
+        mask = np.where(diff >= threshold, 255, 0).astype(np.uint8)
+
+    center = np.zeros((h, w), dtype=np.uint8)
+    cv2.rectangle(
+        center,
+        (int(w * 0.08), int(h * 0.04)),
+        (int(w * 0.92), int(h * 0.96)),
+        255,
+        thickness=-1,
+    )
+    mask = cv2.bitwise_and(mask, center)
+    return clean_foreground_mask(mask, min_area_ratio=0.02)
+
+
+def build_edge_foreground_mask(image: np.ndarray) -> np.ndarray:
+    h, w = image.shape[:2]
+    gray = normalize_illumination_gray(cv2.cvtColor(gray_world_white_balance(image), cv2.COLOR_BGR2GRAY), clip_limit=2.0)
+    median = float(np.median(gray))
+    low = max(18, int(round(median * 0.66)))
+    high = min(220, max(low + 24, int(round(median * 1.36))))
+    edges = cv2.Canny(gray, low, high)
+
+    gradient = cv2.morphologyEx(gray, cv2.MORPH_GRADIENT, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+    _, grad_mask = cv2.threshold(gradient, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    merged = cv2.bitwise_or(edges, grad_mask)
+
+    k = max(5, int(round(min(h, w) * 0.028)))
+    merged = cv2.morphologyEx(merged, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+    merged = cv2.dilate(merged, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (max(3, k // 2), max(3, k // 2))), iterations=1)
+
+    contours, _ = cv2.findContours(merged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    filled = np.zeros_like(merged)
+    min_area = int(h * w * 0.02)
+    for contour in contours:
+        if cv2.contourArea(contour) < min_area:
+            continue
+        cv2.drawContours(filled, [contour], -1, 255, thickness=-1)
+
+    return clean_foreground_mask(filled, min_area_ratio=0.02)
+
+
+def build_grabcut_foreground_mask(image: np.ndarray) -> np.ndarray:
+    h, w = image.shape[:2]
+    if os.getenv("BOTTLE_ENABLE_GRABCUT", "0").lower() not in {"1", "true", "yes", "on"}:
+        return np.zeros((h, w), dtype=np.uint8)
+    if min(h, w) < 80:
+        return np.zeros((h, w), dtype=np.uint8)
+
+    mask = np.zeros((h, w), dtype=np.uint8)
+    rect = (
+        int(w * 0.07),
+        int(h * 0.03),
+        int(w * 0.86),
+        int(h * 0.94),
+    )
+    bgd_model = np.zeros((1, 65), np.float64)
+    fgd_model = np.zeros((1, 65), np.float64)
+
+    try:
+        cv2.grabCut(image, mask, rect, bgd_model, fgd_model, 2, cv2.GC_INIT_WITH_RECT)
+    except Exception:
+        return np.zeros((h, w), dtype=np.uint8)
+
+    foreground = np.where(
+        (mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD),
+        255,
+        0,
+    ).astype(np.uint8)
+    return clean_foreground_mask(foreground, min_area_ratio=0.025)
+
+
+def compute_mask_major_axis_angle(mask: np.ndarray) -> float:
+    ys, xs = np.where(mask > 0)
+    if xs.size < 40:
+        return 90.0
+
+    points = np.column_stack([xs, ys]).astype(np.float32)
+    mean = np.mean(points, axis=0)
+    centered = points - mean
+    cov = np.cov(centered, rowvar=False)
+    if cov.shape != (2, 2):
+        return 90.0
+
+    eigenvalues, eigenvectors = np.linalg.eigh(cov)
+    order = np.argsort(eigenvalues)
+    major = eigenvectors[:, order[-1]]
+    angle = float(np.degrees(np.arctan2(major[1], major[0])))
+    if angle < 0.0:
+        angle += 180.0
+    return angle
+
+
+def score_bottle_mask(mask: np.ndarray, image_shape: Sequence[int]) -> float:
+    box = mask_to_box(mask)
+    if box is None:
+        return -1.0
+
+    h, w = int(image_shape[0]), int(image_shape[1])
+    x1, y1, x2, y2 = box
+    bw = max(1, x2 - x1)
+    bh = max(1, y2 - y1)
+    area = int(np.count_nonzero(mask))
+    area_ratio = area / float(max(1, h * w))
+    fill_ratio = area / float(max(1, bw * bh))
+    cx = (x1 + x2) / 2.0
+    cy = (y1 + y2) / 2.0
+    center_dist = np.hypot((cx / max(1.0, w)) - 0.5, (cy / max(1.0, h)) - 0.5)
+    center_score = max(0.0, 1.0 - (center_dist / 0.72))
+    elongation = max(bw, bh) / float(max(1, min(bw, bh)))
+    elongation_score = max(
+        triangle_pref(elongation, 1.08, 2.3, 8.0),
+        triangle_pref(elongation, 1.02, 1.7, 5.0),
+    )
+    area_score = max(
+        triangle_pref(area_ratio, 0.03, 0.18, 0.92),
+        triangle_pref(area_ratio, 0.05, 0.34, 0.98),
+    )
+    fill_score = triangle_pref(fill_ratio, 0.08, 0.38, 0.94)
+
+    points = np.column_stack(np.where(mask > 0))[:, ::-1].astype(np.float32)
+    rect = cv2.minAreaRect(points)
+    rect_w, rect_h = rect[1]
+    rect_fill = area / float(max(1.0, rect_w * rect_h))
+    rect_fill_score = triangle_pref(rect_fill, 0.10, 0.42, 0.96)
+
+    touches = sum([x1 <= 1, y1 <= 1, x2 >= (w - 1), y2 >= (h - 1)])
+    border_penalty = 0.18 * max(0, touches - 1)
+    if area_ratio > 0.95:
+        border_penalty += 0.8
+
+    score = (
+        area_score * 1.2
+        + center_score * 1.0
+        + elongation_score * 0.8
+        + fill_score * 0.55
+        + rect_fill_score * 0.45
+        - border_penalty
+    )
+    return float(score)
+
+
+def detect_bottle_region(image: np.ndarray) -> BottleDetectionResult:
+    h, w = image.shape[:2]
+    source_masks = {
+        "border": build_border_foreground_mask(image),
+        "edge": build_edge_foreground_mask(image),
+        "grabcut": build_grabcut_foreground_mask(image),
+    }
+    source_masks["union"] = clean_foreground_mask(
+        cv2.bitwise_or(
+            cv2.bitwise_or(source_masks["border"], source_masks["edge"]),
+            source_masks["grabcut"],
+        ),
+        min_area_ratio=0.02,
+    )
+
+    best_result: BottleDetectionResult | None = None
+    min_area = int(h * w * 0.015)
+    max_area = int(h * w * 0.985)
+
+    for source, mask in source_masks.items():
+        if not np.any(mask):
+            continue
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats((mask > 0).astype(np.uint8), connectivity=8)
+        for idx in range(1, num_labels):
+            _, _, _, _, area = stats[idx]
+            if area < min_area or area > max_area:
+                continue
+
+            component = np.where(labels == idx, 255, 0).astype(np.uint8)
+            component = clean_foreground_mask(component, min_area_ratio=0.01)
+            score = score_bottle_mask(component, image.shape)
+            if score <= 0.0:
+                continue
+
+            box_tuple = mask_to_box(component)
+            if box_tuple is None:
+                continue
+
+            candidate = BottleDetectionResult(
+                box=tuple_to_crop_box(clip_box(box_tuple, image.shape)),
+                found=True,
+                confidence=float(score),
+                major_axis_angle=compute_mask_major_axis_angle(component),
+                mask_ratio=float(np.mean(component > 0)),
+                source=source,
+                mask=component,
+            )
+            if best_result is None or candidate.confidence > best_result.confidence:
+                best_result = candidate
+
+    if best_result is None:
+        return BottleDetectionResult(
+            box=CropBox(0, 0, w, h),
+            found=False,
+            confidence=0.0,
+            major_axis_angle=90.0,
+            mask_ratio=0.0,
+            source="none",
+            mask=None,
+        )
+
+    return best_result
+
+
+def normalize_bottle_rotation(angle: float) -> float:
+    normalized = float(angle % 180.0)
+    rotation = 90.0 - normalized
+    if rotation <= -90.0:
+        rotation += 180.0
+    if rotation > 90.0:
+        rotation -= 180.0
+    if abs(rotation) < 1.0:
+        return 0.0
+    return float(rotation)
+
+
+def normalize_rotation_degrees(angle: float) -> float:
+    normalized = ((float(angle) + 180.0) % 360.0) - 180.0
+    if abs(normalized) < 1e-6:
+        return 0.0
+    return float(normalized)
+
+
+def should_rotate_bottle_180(mask: np.ndarray | None) -> bool:
+    if mask is None or not np.any(mask):
+        return False
+
+    box = mask_to_box(mask)
+    if box is None:
+        return False
+
+    x1, y1, x2, y2 = box
+    cropped = mask[y1:y2, x1:x2]
+    if min(cropped.shape[:2]) < 24:
+        return False
+
+    widths = np.sum(cropped > 0, axis=1).astype(np.float32)
+    non_zero_rows = np.where(widths > max(2.0, (x2 - x1) * 0.08))[0]
+    if non_zero_rows.size < 10:
+        return False
+
+    widths = widths[non_zero_rows[0] : non_zero_rows[-1] + 1]
+    smooth = _smooth_1d(widths, kernel_size=max(3, int(round(widths.size * 0.08))))
+    segment = max(4, int(round(smooth.size * 0.22)))
+    trim = max(1, int(round(segment * 0.15)))
+
+    top = float(np.mean(smooth[trim:segment])) if segment > trim else float(np.mean(smooth[:segment]))
+    bottom_slice = smooth[-segment:]
+    bottom = float(np.mean(bottom_slice[:-trim])) if bottom_slice.size > trim else float(np.mean(bottom_slice))
+    centroid_y = float(np.mean(np.where(cropped > 0)[0])) / float(max(1, cropped.shape[0]))
+    width_gap = top - bottom
+    width_threshold = max(6.0, (x2 - x1) * 0.06)
+
+    return bool(top > bottom * 1.10 and width_gap > width_threshold and centroid_y < 0.49)
+
+
+def align_image_to_bottle(
+    image: np.ndarray,
+    bottle_padding_ratio: float = 0.03,
+) -> Tuple[np.ndarray, CropBox, bool, float, bool, float]:
+    detection_image, det_scale = resize_with_max_side(image, max_side=1600)
+    initial_bottle = detect_bottle_region(detection_image)
+    if not initial_bottle.found:
+        full = CropBox(0, 0, image.shape[1], image.shape[0])
+        return image.copy(), full, False, 0.0, False, 0.0
+
+    coarse_rotation = normalize_bottle_rotation(initial_bottle.major_axis_angle)
+    oriented = rotate_bound(image, coarse_rotation) if abs(coarse_rotation) > 0.0 else image.copy()
+
+    oriented_view, oriented_scale = resize_with_max_side(oriented, max_side=1600)
+    aligned_bottle = detect_bottle_region(oriented_view)
+    total_rotation = float(coarse_rotation)
+    upside_down = False
+
+    if aligned_bottle.found and should_rotate_bottle_180(aligned_bottle.mask):
+        oriented = rotate_bound(oriented, 180.0)
+        total_rotation += 180.0
+        upside_down = True
+        oriented_view, oriented_scale = resize_with_max_side(oriented, max_side=1600)
+        aligned_bottle = detect_bottle_region(oriented_view)
+
+    if not aligned_bottle.found:
+        full = CropBox(0, 0, oriented.shape[1], oriented.shape[0])
+        return oriented, full, False, total_rotation, upside_down, initial_bottle.confidence
+
+    bottle_box = scale_box(
+        (aligned_bottle.box.x1, aligned_bottle.box.y1, aligned_bottle.box.x2, aligned_bottle.box.y2),
+        oriented_scale,
+    )
+    bottle_box = clip_box(bottle_box, oriented.shape)
+    padded_bottle = pad_box(bottle_box, oriented.shape, padding_ratio=bottle_padding_ratio)
+
+    confidence = max(initial_bottle.confidence, aligned_bottle.confidence)
+    return oriented, padded_bottle, True, total_rotation, upside_down, float(confidence)
 
 
 def extract_component_boxes(binary: np.ndarray) -> List[Tuple[int, int, int, int]]:
@@ -556,6 +1014,7 @@ def score_candidate(
     area_ratio = float((bw * bh) / max(1.0, h_img * w_img))
     aspect_ratio = float(bw / float(bh + 1e-6))
     y_center_ratio = float(((y1 + y2) / 2.0) / max(1.0, h_img))
+    x_center_ratio = float(((x1 + x2) / 2.0) / max(1.0, w_img))
 
     binaries = [
         cv2.adaptiveThreshold(crop, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 31, 7),
@@ -597,15 +1056,31 @@ def score_candidate(
     ink_score = triangle_pref(best_ink_ratio, 0.02, 0.17, 0.42)
     component_score = min(1.0, best_components / 12.0)
     position_score = max(
-        triangle_pref(y_center_ratio, 0.16, 0.55, 0.82),
-        triangle_pref(y_center_ratio, 0.20, 0.48, 0.74),
+        triangle_pref(y_center_ratio, 0.10, 0.42, 0.72),
+        triangle_pref(y_center_ratio, 0.12, 0.34, 0.64),
     )
+    horizontal_position_score = max(
+        gaussian_pref(x_center_ratio, 0.5, 0.19),
+        triangle_pref(x_center_ratio, 0.08, 0.5, 0.92),
+    )
+    edge_margin = min(x1, y1, max(0, w_img - x2), max(0, h_img - y2)) / float(max(1, min(h_img, w_img)))
+    inner_margin_score = triangle_pref(edge_margin, 0.008, 0.085, 0.24)
 
     bottom_overlay_penalty = 0.0
-    if y1 >= int(h_img * 0.82):
+    if y1 >= int(h_img * 0.78):
         bottom_overlay_penalty += 1.25
-    if y1 >= int(h_img * 0.86) and x1 <= int(w_img * 0.40):
+    if y1 >= int(h_img * 0.84) and x1 <= int(w_img * 0.40):
         bottom_overlay_penalty += 1.5
+    if y_center_ratio >= 0.70:
+        bottom_overlay_penalty += 0.85
+    if x_center_ratio <= 0.12 or x_center_ratio >= 0.88:
+        bottom_overlay_penalty += 0.9
+    elif x_center_ratio <= 0.18 or x_center_ratio >= 0.82:
+        bottom_overlay_penalty += 0.35
+    if best_components <= 2:
+        bottom_overlay_penalty += 0.95
+    elif best_components <= 4:
+        bottom_overlay_penalty += 0.28
     if bh >= int(h_img * 0.22):
         bottom_overlay_penalty += 0.45
 
@@ -620,7 +1095,9 @@ def score_candidate(
         + best_alignment * 0.25
         + best_consistency * 0.2
         + best_gap * 0.15
-        + position_score * 0.45
+        + position_score * 0.72
+        + horizontal_position_score * 0.9
+        + inner_margin_score * 0.4
         - glare_ratio * 0.85
         - bottom_overlay_penalty
     )
@@ -736,6 +1213,88 @@ def tighten_candidate_box(
         y1 + min(crop_h, ry2 + pad_y),
     )
     return clip_box(tightened, image_shape)
+
+
+def expand_candidate_box_to_neighbors(
+    gray: np.ndarray,
+    box: Tuple[int, int, int, int],
+    image_shape: Sequence[int],
+) -> Tuple[int, int, int, int]:
+    x1, y1, x2, y2 = clip_box(box, image_shape)
+    bw = max(1, x2 - x1)
+    bh = max(1, y2 - y1)
+
+    pad_x = max(18, int(round(bw * 1.05)))
+    pad_y = max(14, int(round(bh * 0.85)))
+    wx1, wy1, wx2, wy2 = clip_box((x1 - pad_x, y1 - pad_y, x2 + pad_x, y2 + pad_y), image_shape)
+    window = gray[wy1:wy2, wx1:wx2]
+    if window.size == 0 or min(window.shape[:2]) < 20:
+        return x1, y1, x2, y2
+
+    masks = [
+        cv2.adaptiveThreshold(window, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 31, 7),
+        cv2.adaptiveThreshold(255 - window, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 31, 7),
+    ]
+
+    window_boxes: List[Tuple[int, int, int, int]] = []
+    for mask in masks:
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (5, 3)))
+        window_boxes.extend(extract_component_boxes(mask))
+
+    window_boxes = dedupe_boxes(window_boxes, iou_threshold=0.72)
+    if not window_boxes:
+        return x1, y1, x2, y2
+
+    anchor = (x1 - wx1, y1 - wy1, x2 - wx1, y2 - wy1)
+
+    def is_seed(candidate_box: Tuple[int, int, int, int]) -> bool:
+        if _box_iou(candidate_box, anchor) > 0.0:
+            return True
+        if boxes_are_related(candidate_box, anchor):
+            return True
+
+        cx1, cy1, cx2, cy2 = candidate_box
+        candidate_yc = (cy1 + cy2) / 2.0
+        anchor_yc = (anchor[1] + anchor[3]) / 2.0
+        y_delta = abs(candidate_yc - anchor_yc)
+        gap_x = min(abs(cx1 - anchor[2]), abs(anchor[0] - cx2))
+        return y_delta <= max(16, int(round(bh * 0.95))) and gap_x <= max(18, int(round(bw * 0.75)))
+
+    selected = [candidate_box for candidate_box in window_boxes if is_seed(candidate_box)]
+    if not selected:
+        return x1, y1, x2, y2
+
+    changed = True
+    while changed:
+        changed = False
+        for candidate_box in window_boxes:
+            if candidate_box in selected:
+                continue
+            if any(boxes_are_related(candidate_box, other) or _box_iou(candidate_box, other) > 0.0 for other in selected):
+                selected.append(candidate_box)
+                changed = True
+
+    merged_boxes = selected + [anchor]
+    mx1 = min(candidate_box[0] for candidate_box in merged_boxes)
+    my1 = min(candidate_box[1] for candidate_box in merged_boxes)
+    mx2 = max(candidate_box[2] for candidate_box in merged_boxes)
+    my2 = max(candidate_box[3] for candidate_box in merged_boxes)
+
+    merged_w = max(1, mx2 - mx1)
+    merged_h = max(1, my2 - my1)
+    if merged_w * merged_h > (window.shape[0] * window.shape[1] * 0.82):
+        return x1, y1, x2, y2
+
+    final_pad_x = max(3, int(round(merged_w * 0.08)))
+    final_pad_y = max(3, int(round(merged_h * 0.16)))
+    expanded = (
+        wx1 + max(0, mx1 - final_pad_x),
+        wy1 + max(0, my1 - final_pad_y),
+        wx1 + min(window.shape[1], mx2 + final_pad_x),
+        wy1 + min(window.shape[0], my2 + final_pad_y),
+    )
+    return clip_box(expanded, image_shape)
 
 
 def craft_is_available() -> bool:
@@ -914,6 +1473,8 @@ def choose_best_date_cluster(
             best_score = max(best_score, merged_score.score)
 
     best_box = tighten_candidate_box(gray, best_box, image_shape)
+    best_box = expand_candidate_box_to_neighbors(gray, best_box, image_shape)
+    best_box = tighten_candidate_box(gray, best_box, image_shape)
     scored.append(score_candidate(best_box, gray, glare_mask, image_shape, source=f"{source}_final"))
     scored.sort(key=lambda item: item.score, reverse=True)
 
@@ -925,7 +1486,8 @@ def choose_best_date_cluster(
         if len(unique) >= 6:
             break
 
-    return best_box, unique
+    chosen = unique[0].box if unique else best_box
+    return chosen, unique
 
 
 def detect_text_roi(
@@ -943,6 +1505,7 @@ def detect_text_roi(
     backend_used = detector_backend
     fallback_used = False
     craft_used = False
+    heuristic_boxes: List[Tuple[int, int, int, int]] = []
 
     if detector_backend == "craft":
         try:
@@ -958,13 +1521,28 @@ def detect_text_roi(
             fallback_used = True
             backend_used = "heuristic_fallback"
 
+    component_boxes = build_component_candidate_boxes(detection_gray)
+    line_boxes = build_line_proposals(component_boxes, detection_gray.shape)
+    morph_boxes = build_morph_candidate_boxes(detection_gray)
+    heuristic_boxes = dedupe_boxes(component_boxes + line_boxes + morph_boxes, iou_threshold=0.78)
+
+    if detector_backend == "craft":
+        if boxes and heuristic_boxes:
+            boxes = dedupe_boxes(boxes + heuristic_boxes, iou_threshold=0.76)
+            backend_used = "craft+heuristic"
+        elif heuristic_boxes:
+            boxes = heuristic_boxes
+            backend_used = "heuristic_fallback"
+            fallback_used = True
+    elif not boxes:
+        boxes = heuristic_boxes
+        backend_used = "heuristic"
+
     if not boxes:
         component_boxes = build_component_candidate_boxes(detection_gray)
         line_boxes = build_line_proposals(component_boxes, detection_gray.shape)
         morph_boxes = build_morph_candidate_boxes(detection_gray)
         boxes = dedupe_boxes(component_boxes + line_boxes + morph_boxes, iou_threshold=0.78)
-        if detector_backend != "craft":
-            backend_used = "heuristic"
 
     candidate_count = len(boxes)
     chosen_box, scored_candidates = choose_best_date_cluster(
@@ -982,7 +1560,7 @@ def detect_text_roi(
     chosen_box = tighten_candidate_box(detection_gray, chosen_box, detection_image.shape)
     scaled_box = scale_box(chosen_box, det_scale)
     scaled_box = clip_box(scaled_box, image.shape)
-    crop = pad_box(scaled_box, image.shape, padding_ratio=padding_ratio)
+    crop = pad_text_box(scaled_box, image.shape, padding_ratio=padding_ratio)
     crop_area_ratio = crop.area / float(max(1, original_h * original_w))
     confidence = float(scored_candidates[0].score) if scored_candidates else 0.0
 
@@ -1011,31 +1589,110 @@ def detect_text_roi(
     return crop, True, candidate_count, glare_ratio, top_candidates, confidence, backend_used, fallback_used, craft_used
 
 
+def build_bottle_search_regions(
+    oriented_image: np.ndarray,
+    bottle_box: CropBox,
+    bottle_found: bool,
+) -> List[Tuple[str, CropBox, np.ndarray, float]]:
+    oriented_h, oriented_w = oriented_image.shape[:2]
+    search_regions: List[Tuple[str, CropBox, np.ndarray, float]] = []
+
+    if bottle_found:
+        bottle_crop = oriented_image[bottle_box.y1:bottle_box.y2, bottle_box.x1:bottle_box.x2]
+        if bottle_crop.size:
+            bottle_h, bottle_w = bottle_crop.shape[:2]
+
+            def relative_region(
+                name: str,
+                x1_ratio: float,
+                y1_ratio: float,
+                x2_ratio: float,
+                y2_ratio: float,
+                bonus: float,
+            ) -> None:
+                rel_box = CropBox(
+                    x1=bottle_box.x1 + int(round(bottle_w * x1_ratio)),
+                    y1=bottle_box.y1 + int(round(bottle_h * y1_ratio)),
+                    x2=bottle_box.x1 + int(round(bottle_w * x2_ratio)),
+                    y2=bottle_box.y1 + int(round(bottle_h * y2_ratio)),
+                )
+                rel_box = tuple_to_crop_box(clip_box((rel_box.x1, rel_box.y1, rel_box.x2, rel_box.y2), oriented_image.shape))
+                region = oriented_image[rel_box.y1:rel_box.y2, rel_box.x1:rel_box.x2]
+                if region.size:
+                    search_regions.append((name, rel_box, region, bonus))
+
+            relative_region("bottle_core", 0.16, 0.16, 0.82, 0.62, 1.45)
+            relative_region("bottle_upper", 0.10, 0.10, 0.90, 0.70, 0.85)
+            search_regions.append(("bottle", bottle_box, bottle_crop, 0.18))
+
+    full_box = CropBox(0, 0, oriented_w, oriented_h)
+    search_regions.append(("full", full_box, oriented_image, 0.0))
+    return search_regions
+
+
+
+def normalize_text_angle(angle: float) -> float:
+    normalized = float(angle)
+    while normalized <= -45.0:
+        normalized += 90.0
+    while normalized > 45.0:
+        normalized -= 90.0
+    return normalized
+
 
 def estimate_rotation_angle(gray: np.ndarray) -> float:
     blur = cv2.GaussianBlur(gray, (3, 3), 0)
-    binary = cv2.adaptiveThreshold(
-        blur,
-        255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV,
-        31,
-        13,
-    )
-    coords = np.column_stack(np.where(binary > 0))
-    if len(coords) < 100:
-        return 0.0
+    binaries = [
+        cv2.adaptiveThreshold(
+            blur,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV,
+            31,
+            9,
+        ),
+        cv2.adaptiveThreshold(
+            255 - blur,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV,
+            31,
+            9,
+        ),
+    ]
 
-    rect = cv2.minAreaRect(coords[:, ::-1].astype(np.float32))
-    angle = float(rect[-1])
-    if angle < -45:
-        angle = 90 + angle
-    elif angle > 45:
-        angle = angle - 90
+    best_score = 0.0
+    best_angle = 0.0
+    for binary in binaries:
+        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)))
+        component_boxes = extract_component_boxes(binary)
+        if len(component_boxes) >= 2:
+            proposals = build_line_proposals(component_boxes, binary.shape)
+            if proposals:
+                x1, y1, x2, y2 = proposals[0]
+                focus = binary[y1:y2, x1:x2]
+                coords = np.column_stack(np.where(focus > 0))
+                if len(coords) >= 40:
+                    rect = cv2.minAreaRect(coords[:, ::-1].astype(np.float32))
+                    angle = normalize_text_angle(float(rect[-1]))
+                    score = score_binary_quality(binary) + 0.35
+                    if abs(angle) <= 28.0 and score > best_score:
+                        best_score = score
+                        best_angle = angle
 
-    if abs(angle) < 0.8 or abs(angle) > 12.0:
+        coords = np.column_stack(np.where(binary > 0))
+        if len(coords) < 80:
+            continue
+        rect = cv2.minAreaRect(coords[:, ::-1].astype(np.float32))
+        angle = normalize_text_angle(float(rect[-1]))
+        score = score_binary_quality(binary)
+        if abs(angle) <= 28.0 and score > best_score:
+            best_score = score
+            best_angle = angle
+
+    if abs(best_angle) < 0.7:
         return 0.0
-    return angle
+    return float(best_angle)
 
 
 def rotate_bound(image: np.ndarray, angle: float) -> np.ndarray:
@@ -1057,6 +1714,53 @@ def rotate_bound(image: np.ndarray, angle: float) -> np.ndarray:
         flags=cv2.INTER_LANCZOS4,
         borderMode=cv2.BORDER_REPLICATE,
     )
+
+
+def score_text_orientation(gray: np.ndarray) -> float:
+    dark = cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        31,
+        7,
+    )
+    light = cv2.adaptiveThreshold(
+        255 - gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        31,
+        7,
+    )
+    best = max(score_binary_quality(dark), score_binary_quality(light))
+    aspect = gray.shape[1] / float(max(1, gray.shape[0]))
+    return float(best + triangle_pref(aspect, 0.85, 2.8, 10.0) * 0.45)
+
+
+def orient_crop_for_text(image: np.ndarray) -> Tuple[np.ndarray, float]:
+    variants: List[Tuple[float, np.ndarray]] = [
+        (0.0, image.copy()),
+        (90.0, rotate_bound(image, 90.0)),
+        (-90.0, rotate_bound(image, -90.0)),
+    ]
+
+    best_rotation = 0.0
+    best_image = image.copy()
+    best_score = -1.0
+    for rotation, candidate in variants:
+        gray = prepare_luminance_for_digits(candidate)
+        score = score_text_orientation(gray)
+        if score > best_score:
+            best_score = score
+            best_rotation = rotation
+            best_image = candidate
+
+    fine_angle = estimate_rotation_angle(cv2.cvtColor(best_image, cv2.COLOR_BGR2GRAY))
+    if abs(fine_angle) > 0.0:
+        best_image = rotate_bound(best_image, -fine_angle)
+
+    return best_image, float(best_rotation - fine_angle)
 
 
 def unsharp_mask(image: np.ndarray, sigma: float = 1.2, amount: float = 1.35) -> np.ndarray:
@@ -1169,42 +1873,89 @@ def process_image(
 ) -> ProcessResult:
     image = decode_image(file_bytes)
     original_h, original_w = image.shape[:2]
-
-    crop_box, crop_found, candidate_boxes, glare_ratio, top_candidates, detection_confidence, backend_used, fallback_used, craft_used = detect_text_roi(
-        image,
-        padding_ratio=crop_padding_ratio,
-        detector_backend=detector_backend,
+    oriented_image, bottle_box, bottle_found, bottle_rotation, bottle_upside_down, bottle_confidence = align_image_to_bottle(
+        image
     )
-    crop_bgr = image[crop_box.y1:crop_box.y2, crop_box.x1:crop_box.x2].copy()
+    oriented_h, oriented_w = oriented_image.shape[:2]
+
+    search_regions = build_bottle_search_regions(oriented_image, bottle_box, bottle_found)
+
+    best_detection: Tuple[CropBox, bool, int, float, List[Dict[str, float | int | str]], float, str, bool, bool, float] | None = None
+
+    for region_name, region_box, region_image, region_bonus in search_regions:
+        local_crop, crop_found, candidate_boxes, glare_ratio, top_candidates, detection_confidence, backend_used, fallback_used, craft_used = detect_text_roi(
+            region_image,
+            padding_ratio=crop_padding_ratio,
+            detector_backend=detector_backend,
+        )
+
+        global_crop = offset_crop_box(local_crop, region_box.x1, region_box.y1)
+        adjusted_candidates: List[Dict[str, float | int | str]] = []
+        for candidate in top_candidates:
+            adjusted_candidates.append(
+                {
+                    **candidate,
+                    "x1": int(candidate["x1"]) + region_box.x1,
+                    "y1": int(candidate["y1"]) + region_box.y1,
+                    "x2": int(candidate["x2"]) + region_box.x1,
+                    "y2": int(candidate["y2"]) + region_box.y1,
+                }
+            )
+
+        selection_score = float(detection_confidence) + region_bonus + (1.4 if crop_found else -0.8)
+        current = (
+            global_crop,
+            crop_found,
+            candidate_boxes,
+            glare_ratio,
+            adjusted_candidates,
+            detection_confidence,
+            backend_used,
+            fallback_used,
+            craft_used,
+            selection_score,
+        )
+
+        if best_detection is None or current[-1] > best_detection[-1]:
+            best_detection = current
+
+    assert best_detection is not None
+    crop_box, crop_found, candidate_boxes, glare_ratio, top_candidates, detection_confidence, backend_used, fallback_used, craft_used, _ = best_detection
+    crop_box = tuple_to_crop_box(clip_box((crop_box.x1, crop_box.y1, crop_box.x2, crop_box.y2), oriented_image.shape))
+    crop_bgr = oriented_image[crop_box.y1:crop_box.y2, crop_box.x1:crop_box.x2].copy()
 
     if crop_bgr.size == 0:
-        crop_bgr = image.copy()
-        crop_box = CropBox(0, 0, original_w, original_h)
+        crop_bgr = oriented_image.copy()
+        crop_box = CropBox(0, 0, oriented_w, oriented_h)
         crop_found = False
 
-    cropped = crop_bgr.copy()
-    cropped, upscale_factor = resize_with_min_side(
-        cropped,
+    crop_bgr, upscale_factor = resize_with_min_side(
+        crop_bgr,
         min_side=min_side_after_crop,
         max_side=max_side_after_crop,
     )
+    crop_bgr, crop_rotation = orient_crop_for_text(crop_bgr)
 
-    gray_crop = cv2.cvtColor(cropped, cv2.COLOR_BGR2GRAY)
-    angle = estimate_rotation_angle(gray_crop)
-    rotated = rotate_bound(cropped, -angle) if abs(angle) > 0.0 else cropped
-
-    improved = boost_for_digits(rotated)
+    improved = boost_for_digits(crop_bgr)
     high_contrast = build_high_contrast_variant(improved)
     bw = build_bw_variant(improved)
 
     metadata = ProcessMetadata(
         original_width=original_w,
         original_height=original_h,
-        crop_box={"x1": int(crop_box.x1), "y1": int(crop_box.y1), "x2": int(crop_box.x2), "y2": int(crop_box.y2)},
+        oriented_width=oriented_w,
+        oriented_height=oriented_h,
+        bottle_box=box_to_dict(bottle_box),
+        bottle_found=bottle_found,
+        bottle_confidence=round(float(bottle_confidence), 4),
+        bottle_rotation_degrees=round(normalize_rotation_degrees(bottle_rotation), 3),
+        bottle_upside_down_corrected=bool(bottle_upside_down),
+        crop_box=box_to_dict(crop_box),
         crop_found=crop_found,
         upscale_factor=round(float(upscale_factor), 4),
         candidate_boxes=int(candidate_boxes),
-        rotated_degrees=round(float(angle), 3),
+        rotated_degrees=round(normalize_rotation_degrees(crop_rotation), 3),
+        final_rotation_degrees=round(normalize_rotation_degrees(bottle_rotation + crop_rotation), 3),
         glare_ratio=round(float(glare_ratio), 4),
         detection_confidence=round(float(detection_confidence), 4),
         top_candidates=top_candidates,
@@ -1215,6 +1966,7 @@ def process_image(
     )
 
     return ProcessResult(
+        oriented_bgr=oriented_image,
         crop_bgr=crop_bgr,
         improved_bgr=improved,
         bw=bw,

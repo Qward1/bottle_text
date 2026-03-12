@@ -1,0 +1,25 @@
+services:
+  bottle-text-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: bottle-text-service:latest
+    container_name: bottle-text-service
+    ports:
+      - "8000:8000"
+    environment:
+      BOTTLE_CRAFT_LONG_SIZE: "1280"
+      BOTTLE_CRAFT_TEXT_THRESHOLD: "0.42"
+      BOTTLE_CRAFT_LINK_THRESHOLD: "0.18"
+      BOTTLE_CRAFT_LOW_TEXT: "0.18"
+      BOTTLE_CRAFT_REFINER: "0"
+      BOTTLE_ENABLE_GRABCUT: "0"
+    volumes:
+      - ./outputs:/app/app/outputs
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped

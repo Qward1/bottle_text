@@ -12,7 +12,7 @@ from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from app.processor import decode_image, encode_image, process_image
+from app.processor import encode_image, process_image
 
 app = FastAPI(
     title="Bottle Date Enhancer",
@@ -37,21 +37,41 @@ OUTPUTS_DIR = Path(__file__).resolve().parent / "outputs"
 OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def build_debug_roi_image(original_bgr, crop_box: dict[str, int]):
-    overlay = original_bgr.copy()
-    cv2.rectangle(
-        overlay,
-        (int(crop_box["x1"]), int(crop_box["y1"])),
-        (int(crop_box["x2"]), int(crop_box["y2"])),
-        (0, 255, 0),
-        3,
-    )
+def build_debug_roi_image(
+    oriented_bgr,
+    bottle_box: dict[str, int],
+    crop_box: dict[str, int],
+    bottle_found: bool,
+    crop_found: bool,
+):
+    overlay = oriented_bgr.copy()
+    if bottle_found:
+        cv2.rectangle(
+            overlay,
+            (int(bottle_box["x1"]), int(bottle_box["y1"])),
+            (int(bottle_box["x2"]), int(bottle_box["y2"])),
+            (255, 160, 0),
+            3,
+        )
+    if crop_found:
+        cv2.rectangle(
+            overlay,
+            (int(crop_box["x1"]), int(crop_box["y1"])),
+            (int(crop_box["x2"]), int(crop_box["y2"])),
+            (0, 255, 0),
+            3,
+        )
     return overlay
 
 
-def build_output_images(content: bytes, result) -> list[tuple[str, str, bytes]]:
-    original_bgr = decode_image(content)
-    debug_roi_bgr = build_debug_roi_image(original_bgr, result.metadata.crop_box)
+def build_output_images(result) -> list[tuple[str, str, bytes]]:
+    debug_roi_bgr = build_debug_roi_image(
+        result.oriented_bgr,
+        result.metadata.bottle_box,
+        result.metadata.crop_box,
+        result.metadata.bottle_found,
+        result.metadata.crop_found,
+    )
     return [
         ("crop_preview.jpg", "image/jpeg", encode_image(result.crop_bgr, ext=".jpg", quality=95)),
         ("improved.jpg", "image/jpeg", encode_image(result.improved_bgr, ext=".jpg", quality=96)),
@@ -117,7 +137,7 @@ async def process_endpoint(
     except Exception as exc:  # pragma: no cover
         raise HTTPException(status_code=500, detail=f"Ошибка обработки: {exc}") from exc
 
-    images = build_output_images(content, result)
+    images = build_output_images(result)
 
     if response_format == "json_links":
         batch_id = save_output_images(images)

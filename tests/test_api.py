@@ -106,15 +106,11 @@ class ProcessEndpointTests(unittest.TestCase):
         assert high_contrast is not None
         assert debug_roi is not None
 
-        original = cv2.imdecode(np.frombuffer(content, np.uint8), cv2.IMREAD_COLOR)
-        self.assertIsNotNone(original)
-        assert original is not None
-
         self.assertEqual(crop.shape[:2], expected.crop_bgr.shape[:2])
         self.assertEqual(improved.shape[:2], expected.improved_bgr.shape[:2])
         self.assertEqual(bw.shape[:2], expected.bw.shape[:2])
         self.assertEqual(high_contrast.shape[:2], expected.high_contrast.shape[:2])
-        self.assertEqual(debug_roi.shape[:2], original.shape[:2])
+        self.assertEqual(debug_roi.shape[:2], expected.oriented_bgr.shape[:2])
 
     def test_process_returns_json_links_for_dify(self) -> None:
         content, _ = build_challenging_bottle()
@@ -164,15 +160,11 @@ class ProcessEndpointTests(unittest.TestCase):
         assert high_contrast is not None
         assert debug_roi is not None
 
-        original = cv2.imdecode(np.frombuffer(content, np.uint8), cv2.IMREAD_COLOR)
-        self.assertIsNotNone(original)
-        assert original is not None
-
         self.assertEqual(crop.shape[:2], expected.crop_bgr.shape[:2])
         self.assertEqual(improved.shape[:2], expected.improved_bgr.shape[:2])
         self.assertEqual(bw.shape[:2], expected.bw.shape[:2])
         self.assertEqual(high_contrast.shape[:2], expected.high_contrast.shape[:2])
-        self.assertEqual(debug_roi.shape[:2], original.shape[:2])
+        self.assertEqual(debug_roi.shape[:2], expected.oriented_bgr.shape[:2])
 
 
 if __name__ == "__main__":
